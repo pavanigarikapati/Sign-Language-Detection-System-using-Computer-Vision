@@ -1,0 +1,341 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+from collections import Counter
+
+# Initialize MediaPipe Hands
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+   
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.5,  # Lowered threshold for better detection
+    min_tracking_confidence=0.5    # Lowered threshold for better tracking
+)
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# Gesture recognition functions
+def calculate_distances(landmarks):
+    """Calculate distances between key points for gesture detection"""
+    distances = {}
+    # Fingertips indices (thumb, index, middle, ring, pinky)
+    fingertips = [4, 8, 12, 16, 20]
+    # Finger bases indices
+    bases = [2, 5, 9, 13, 17]
+    # Calculate distance from thumb to each fingertip
+    for i in range(1, 5):  # For each finger except thumb
+        distances[f'thumb_to_{i}'] = distance_between(landmarks[4], landmarks[fingertips[i]])
+   
+    # Calculate fingertip to palm distances
+    wrist = landmarks[0]
+    for i, tip in enumerate(fingertips):
+        distances[f'tip_{i}_extended'] = distance_between(landmarks[tip], landmarks[bases[i]])
+        distances[f'tip_{i}_to_wrist'] = distance_between(landmarks[tip], wrist)
+   
+    # Calculate angles for fingers
+    for i in range(5):  # For each finger
+        if i == 0:  # Thumb
+            distances[f'angle_{i}'] = angle_between(
+                landmarks[1], landmarks[2], landmarks[4]
+            )
+        else:  # Other fingers
+            distances[f'angle_{i}'] = angle_between(
+                landmarks[bases[i]], landmarks[fingertips[i]-2], landmarks[fingertips[i]]
+            )
+           
+    return distances
+
+def distance_between(p1, p2):
+    """Calculate Euclidean distance between two points"""
+    return math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2)
+
+def angle_between(p1, p2, p3):
+    """Calculate angle between three points"""
+    v1 = np.array([p1.x - p2.x, p1.y - p2.y, p1.z - p2.z])
+    v2 = np.array([p3.x - p2.x, p3.y - p2.y, p3.z - p2.z])
+   
+    v1_norm = np.linalg.norm(v1)
+    v2_norm = np.linalg.norm(v2)
+   
+    if v1_norm == 0 or v2_norm == 0:
+        return 0
+   
+    dot_product = np.dot(v1, v2)
+    angle_rad = np.arccos(np.clip(dot_product / (v1_norm * v2_norm), -1.0, 1.0))
+    return np.degrees(angle_rad)
+
+def is_finger_extended(landmarks, finger_id):
+    """Check if a finger is extended based on its landmarks"""
+    if finger_id == 0:  # Thumb
+        finger_tip = 4
+        finger_base = 2
+    else:
+        finger_tip = 8 + (finger_id - 1) * 4
+        finger_base = 5 + (finger_id - 1) * 4
+   
+    # Get the coordinates
+    tip_y = landmarks[finger_tip].y
+    base_y = landmarks[finger_base].y
+   
+    # A finger is extended if the tip is higher than the base
+    return tip_y < base_y
+
+def recognize_gesture(landmarks):
+    """Recognize hand gestures based on landmarks"""
+    if not landmarks:
+        return "No hand detected"
+   
+    # SUPER SIMPLE PEACE SIGN CHECK FIRST
+    # Check if index and middle fingers are extended
+    index_extended = is_finger_extended(landmarks, 1)
+    middle_extended = is_finger_extended(landmarks, 2)
+   
+    # Check if ring and pinky are not extended
+    ring_extended = is_finger_extended(landmarks, 3)
+    pinky_extended = is_finger_extended(landmarks, 4)
+   
+    # Check if thumb is not extended (or doesn't matter)
+    thumb_extended = is_finger_extended(landmarks, 0)
+   
+    # For peace sign: index and middle must be up, others down
+    if index_extended and middle_extended and not ring_extended and not pinky_extended:
+        # Make sure index and middle are separated enough to be a peace sign
+        index_middle_distance = distance_between(landmarks[8], landmarks[12])
+        if index_middle_distance > 0.04:
+            return "Victory/Peace ✌️"
+   
+    # EXTREMELY SIMPLE PEACE SIGN - Highest priority
+    # Just check if index and middle fingers are up and others are down
+    index_up = landmarks[8].y < landmarks[5].y
+    middle_up = landmarks[12].y < landmarks[9].y
+   
+    # Check if only index and middle are extended
+    if index_up and middle_up:
+        # Measure if they're separated (not crossed)
+        index_middle_distance = distance_between(landmarks[8], landmarks[12])
+       
+        # Check other fingers are not extended
+        other_fingers_down = (landmarks[16].y > landmarks[13].y) and (landmarks[20].y > landmarks[17].y)
+       
+        # Simpler peace sign detection - just check if index and middle are up and separated
+        if index_middle_distance > 0.05 and other_fingers_down:
+            return "Victory/Peace ✌️"
+   
+    # Calculate basic finger positions first
+    fingertips = [4, 8, 12, 16, 20]  # Thumb, index, middle, ring, pinky
+    finger_pips = [2, 6, 10, 14, 18]  # Second joint of each finger
+    finger_mcps = [1, 5, 9, 13, 17]  # Base knuckles
+   
+    # Calculate finger extension in a more robust way
+    fingers_extended = []
+   
+    # Special case for thumb
+    thumb_tip_mcp_dist = distance_between(landmarks[4], landmarks[1])
+    thumb_is_out = thumb_tip_mcp_dist > 0.1  # Threshold for thumb being away from palm
+    fingers_extended.append(thumb_is_out)
+   
+    # For other fingers, use both y-coordinate and distance
+    for i in range(1, 5):
+        tip_idx = fingertips[i]
+        pip_idx = finger_pips[i]
+        mcp_idx = finger_mcps[i]
+       
+        # A finger is extended if the tip is higher than the pip joint AND
+        # the distance from tip to MCP is significant
+        tip_mcp_dist = distance_between(landmarks[tip_idx], landmarks[mcp_idx])
+        is_extended = (landmarks[tip_idx].y < landmarks[pip_idx].y) and (tip_mcp_dist > 0.09)
+        fingers_extended.append(is_extended)
+   
+    # 10. INDEX FINGER POINTING - IMPROVED DETECTION
+    # Check if index finger is significantly extended
+    index_extended_dist = distance_between(landmarks[8], landmarks[5])
+   
+    # For pointing, index should be clearly extended
+    if index_extended_dist > 0.08:  # Lowered threshold for better detection
+        # Check if other fingers are less extended
+        other_fingers = [distance_between(landmarks[12], landmarks[9]),   # middle
+                         distance_between(landmarks[16], landmarks[13]),  # ring
+                         distance_between(landmarks[20], landmarks[17])]  # pinky
+       
+        # Check if index is more extended than others (relaxed condition)
+        index_is_dominant = all(index_extended_dist > 1.2 * dist for dist in other_fingers)
+       
+        # Check if index is pointing upward (standing)
+        # For standing index, we check if the index finger is more vertical than horizontal
+        index_vertical = abs(landmarks[8].y - landmarks[5].y) > abs(landmarks[8].x - landmarks[5].x)
+       
+        # Thumb should not be fully extended
+        thumb_not_extended = distance_between(landmarks[4], landmarks[1]) < 0.15
+       
+        # Check if index is pointing upward (lower y value) or standing (vertical)
+        index_up = landmarks[8].y < landmarks[5].y or index_vertical
+       
+        if index_is_dominant and index_up and thumb_not_extended:
+            return "Pointing/Look here ☝️"
+   
+    # 4. Fingers crossed - CRITICAL FIX
+    # Check specifically for the case where index and middle finger are close to each other
+    index_middle_dist_tip = distance_between(landmarks[8], landmarks[12])
+   
+    # Check if index and middle are close at the tips
+    if index_middle_dist_tip < 0.06:
+        # Make sure both index and middle fingers are extended
+        index_extended = distance_between(landmarks[8], landmarks[5]) > 0.08
+        middle_extended = distance_between(landmarks[12], landmarks[9]) > 0.08
+       
+        # For crossed fingers, they should be at similar height
+        tips_y_diff = abs(landmarks[8].y - landmarks[12].y) < 0.04
+       
+        # Other fingers should not be extended fully
+        other_fingers_down = not fingers_extended[3] and not fingers_extended[4]
+       
+        if index_extended and middle_extended and tips_y_diff and other_fingers_down:
+            return "Good Luck 🤞"
+   
+    # 1.1 Thumbs down sign 👎 - IMPROVED DETECTION
+    # Check for thumbs down BEFORE fist detection to avoid confusion
+    if fingers_extended[0] and not any(fingers_extended[1:]):
+        # Make sure thumb is pointing downward
+        is_thumb_down = landmarks[4].y > landmarks[3].y and landmarks[3].y > landmarks[2].y
+       
+        # For thumbs down, the thumb should be more vertical than horizontal
+        thumb_vertical = abs(landmarks[4].y - landmarks[2].y) > abs(landmarks[4].x - landmarks[2].x)
+       
+        # Additional check: thumb should be significantly extended
+        thumb_extended = distance_between(landmarks[4], landmarks[1]) > 0.15
+       
+        if is_thumb_down and thumb_vertical and thumb_extended:
+            return "Not OK 👎"
+
+    wrist = landmarks[0]
+   
+    # Calculate the average distance from fingertips to wrist
+    index_to_wrist = distance_between(landmarks[8], wrist)
+    middle_to_wrist = distance_between(landmarks[12], wrist)
+    ring_to_wrist = distance_between(landmarks[16], wrist)
+    pinky_to_wrist = distance_between(landmarks[20], wrist)
+   
+    # Calculate the average distance from finger bases to wrist
+    index_base_to_wrist = distance_between(landmarks[5], wrist)
+    middle_base_to_wrist = distance_between(landmarks[9], wrist)
+    ring_base_to_wrist = distance_between(landmarks[13], wrist)
+    pinky_base_to_wrist = distance_between(landmarks[17], wrist)
+   
+    # For a fist, the fingertips should be close to their bases
+    # This means the ratio of tip-to-wrist to base-to-wrist should be close to 1
+    index_ratio = index_to_wrist / index_base_to_wrist if index_base_to_wrist > 0 else 0
+    middle_ratio = middle_to_wrist / middle_base_to_wrist if middle_base_to_wrist > 0 else 0
+    ring_ratio = ring_to_wrist / ring_base_to_wrist if ring_base_to_wrist > 0 else 0
+    pinky_ratio = pinky_to_wrist / pinky_base_to_wrist if pinky_base_to_wrist > 0 else 0
+   
+    # For a fist, all ratios should be close to 1 (fingers curled)
+    # We use a very lenient threshold of 1.5
+    is_fist = (index_ratio < 1.5 and middle_ratio < 1.5 and
+               ring_ratio < 1.5 and pinky_ratio < 1.5)
+   
+    # Also check if thumb is not fully extended
+    thumb_tip_mcp_dist = distance_between(landmarks[4], landmarks[1])
+    thumb_not_extended = thumb_tip_mcp_dist < 0.25  # Very lenient threshold
+   
+    if is_fist and thumb_not_extended:
+        return "Ready/Fist ✊"
+   
+    # 1. Thumbs up sign 👍 - Better detection
+    if fingers_extended[0] and not any(fingers_extended[1:]):
+        # Make sure thumb is pointing upward
+        is_thumb_up = landmarks[4].y < landmarks[3].y and landmarks[3].y < landmarks[2].y
+        # For thumbs up, the thumb should be more vertical than horizontal
+        thumb_vertical = abs(landmarks[4].y - landmarks[2].y) > abs(landmarks[4].x - landmarks[2].x)
+       
+        if is_thumb_up and thumb_vertical:
+            return "Done/OK 👍"
+   
+    # 9. OK Sign - Check this early due to common confusion with other gestures
+    thumb_index_dist = distance_between(landmarks[4], landmarks[8])
+    # Check if thumb and index are touching (forming a circle)
+    if thumb_index_dist < 0.05:
+        # Check if other fingers are extended
+        if (fingers_extended[2] or fingers_extended[3] or fingers_extended[4]):
+            # Make sure thumb and index are actually forming a circle (similar y position)
+            thumb_index_y_diff = abs(landmarks[4].y - landmarks[8].y)
+            if thumb_index_y_diff < 0.1:
+                return "OK 👌"
+   
+    # 3. I Love You Sign 🤟
+    if fingers_extended[0] and fingers_extended[1] and not fingers_extended[2] and not fingers_extended[3] and fingers_extended[4]:
+        # Thumb, index, and pinky are extended
+        # Check that pinky is actually extended upward
+        if landmarks[20].y < landmarks[18].y:
+            return "Love 🤟"
+   
+    # 5. L sign - Improved detection
+    if fingers_extended[0] and fingers_extended[1] and not any(fingers_extended[2:]):
+        # Make sure thumb is roughly horizontal and index is vertical
+        # Check thumb is extended sideways (X-axis difference)
+        thumb_horizontal = abs(landmarks[4].x - landmarks[3].x) > 0.05 and abs(landmarks[4].y - landmarks[3].y) < 0.05
+        # Check index is extended upwards (Y-axis difference)
+        index_vertical = (landmarks[5].y - landmarks[8].y) > 0.08
+       
+        if thumb_horizontal and index_vertical:
+            return "Lose/Lost L"
+   
+    # 6. Full open fingers
+    if all(fingers_extended):
+        # All fingers extended
+        # Make sure they're spread apart
+        thumb_pinky_dist = distance_between(landmarks[4], landmarks[20])
+        if thumb_pinky_dist > 0.2:  # Significant distance between thumb and pinky
+            return "Hello/Hi ✋"
+   
+    return "Unknown gesture"
+
+# Main function
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Cannot open camera")
+        return
+   
+    print("Hand Gesture Recognition Started. Press 'q' to quit.")
+    print("Supported gestures:")
+    print("1. Thumbs up sign 👍 - Done/OK")
+    print("2. Thumbs down sign 👎 - Not OK")
+    print("3. I Love You Sign 🤟 - Love")
+    print("4. Fingers crossed 🤞 - Good Luck")
+    print("5. L sign - Lose/Lost")
+    print("6. Full open fingers ✋ - Hi/Hello")
+    print("7. Peace Sign ✌️ - Victory/Peace")
+    print("8. OK Sign 👌 - OK/Super")
+    print("9. Index Finger Pointing ☝️ - Pointing/Look here")
+    print("10. Fist ✊ - Ready")
+   
+    # For smoothing out gesture recognition
+    recent_gestures = []
+    max_recent = 3
+    last_printed_gesture = None
+   
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Can't receive frame. Exiting...")
+            break
+       
+        # Flip the frame horizontally for a later selfie-view display
+        frame = cv2.flip(frame, 1)
+       
+        # Convert the BGR image to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+       
+        # Process the frame with MediaPipe Hands
+        results = hands.process(rgb_frame)
+       
+        # Draw hand landmarks on the frame
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_drawing_styles.get_default_hand_landmarks_style()
